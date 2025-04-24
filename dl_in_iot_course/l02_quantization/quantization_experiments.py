@@ -1,10 +1,33 @@
 import argparse
+import logging
+import multiprocessing
+import sys
+
+import numpy as np
 import tensorflow as tf
+from ai_edge_litert.interpreter import Interpreter
 from pathlib import Path
 from typing import Optional
 
 from dl_in_iot_course.misc.pet_dataset import PetDataset
 from dl_in_iot_course.misc.modeltester import ModelTester
+
+
+logger = logging.Logger("ModelTester")
+formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+
+logdir = Path(__file__).parent / "logs"
+file_handler = logging.FileHandler(logdir / "log.txt")
+file_handler.setLevel(logging.DEBUG)
+file_handler.setFormatter(formatter)
+
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(formatter)
+
+logger.setLevel(logging.DEBUG)
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
 
 
 class NativeModel(ModelTester):
@@ -17,7 +40,7 @@ class NativeModel(ModelTester):
 
     def prepare_model(self):
         self.model = tf.keras.models.load_model(str(self.modelpath))
-        # TODO print model summary
+        logger.info(self.model.summary())
 
     def preprocess_input(self, X):
         self.X = X
@@ -31,18 +54,35 @@ class FP32Model(ModelTester):
     This tester tests the performance of FP32 TensorFlow Lite model.
     """
 
-    # TODO def optimize_model(self, originalmodel: Path):
+    def optimize_model(self, originalmodel: Path):
+        model = tf.keras.models.load_model(str(originalmodel))
+        converter = tf.lite.TFLiteConverter.from_keras_model(model)
+        tflite_model = converter.convert()
+        self.modelpath.write_bytes(tflite_model)
+        logger.info(f"Model converted and saved to {self.modelpath}")
 
-    # TODO def prepare_model(self):
+    def prepare_model(self):
+        self.model = Interpreter(
+            model_path=str(self.modelpath), num_threads=multiprocessing.cpu_count()
+        )
+
+        self.model.allocate_tensors()
+        logger.info(f"Model loaded with {multiprocessing.cpu_count()} threads.")
 
     def preprocess_input(self, X):
         # since we only want to measure inference time, not tensor allocation,
         # we mode setting tensor to preprocess_input
         self.model.set_tensor(self.model.get_input_details()[0]["index"], X)
+        logger.debug("Input data set for the interpreter.")
 
-    # TODO def run_inference(self):
+    def run_inference(self):
+        self.model.invoke()
 
-    # TODO def postprocess_outputs(self, Y):
+    def postprocess_outputs(self, Y):
+        output_details = self.model.get_output_details()[0]
+        output = self.model.get_tensor(output_details["index"])
+        logger.debug("Output data retrieved from the interpreter.")
+        return output
 
 
 class INT8Model(ModelTester):
@@ -83,21 +123,69 @@ class INT8Model(ModelTester):
                 self.calibrationdatasetpercent, 1234
             )
 
-        # TODO finish implementation
+        model = tf.keras.models.load_model(str(originalmodel))
 
-    # TODO def prepare_model(self):
+        converter = tf.lite.TFLiteConverter.from_keras_model(model)
+        converter.optimizations = [tf.lite.Optimize.DEFAULT]
+        converter.representative_dataset = calibration_dataset_generator
+        converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+        converter.inference_input_type = tf.int8
+        converter.inference_output_type = tf.int8
 
-    # TODO def preprocess_input(self, X):
+        tflite_model = converter.convert()
+        self.modelpath.write_bytes(tflite_model)
+        logger.info(f"Model converted and saved to {self.modelpath}")
 
-    # TODO def run_inference(self):
+    def prepare_model(self):
+        self.model = Interpreter(
+            model_path=str(self.modelpath), num_threads=multiprocessing.cpu_count()
+        )
 
-    # TODO def postprocess_outputs(self, Y):
+        self.model.allocate_tensors()
+        logger.info(f"Model loaded with {multiprocessing.cpu_count()} threads.")
+
+    def preprocess_input(self, X):
+        scale, zero_point = self.model.get_input_details()[0]["quantization"]
+        X = np.round(X / scale + zero_point)
+        X = X.astype(self.model.get_input_details()[0]["dtype"])
+        self.model.set_tensor(self.model.get_input_details()[0]["index"], X)
+        logger.debug(
+            "Input data converted to int8 and set in memory for the interpreter."
+        )
+
+    def run_inference(self):
+        self.model.invoke()
+
+    def postprocess_outputs(self, Y):
+        output_details = self.model.get_output_details()[0]
+        scale, zero_point = output_details["quantization"]
+        output = (
+            self.model.get_tensor(output_details["index"]).astype(np.float32)
+            - zero_point
+        ) * scale
+        logger.debug("Output data retrieved from the interpreter.")
+        return output
 
 
 class ImbalancedINT8Model(INT8Model):
     def optimize_model(self, originalmodel: Path):
-        # TODO implement
-        pass
+        def calibration_dataset_generator():
+            for x, y in zip(self.dataset.dataX, self.dataset.dataY):
+                if y == 5:
+                    yield [self.dataset.prepare_input_sample(x)]
+
+        model = tf.keras.models.load_model(str(originalmodel))
+
+        converter = tf.lite.TFLiteConverter.from_keras_model(model)
+        converter.optimizations = [tf.lite.Optimize.DEFAULT]
+        converter.representative_dataset = calibration_dataset_generator
+        converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+        converter.inference_input_type = tf.int8
+        converter.inference_output_type = tf.int8
+
+        tflite_model = converter.convert()
+        self.modelpath.write_bytes(tflite_model)
+        logger.info(f"Model converted and saved to {self.modelpath}")
 
 
 if __name__ == "__main__":
