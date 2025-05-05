@@ -3,17 +3,18 @@ Script for verifying the structured pruning with NNI framework.
 """
 
 import argparse
+import shutil
+import time
+from pathlib import Path
+
+import ai_edge_torch  # noqa: F401
+import nni  # noqa: F401
 import torch
+from nni.compression.pytorch import ModelSpeedup  # noqa: F401
+from nni.compression.pytorch.pruning import ActivationAPoZRankPruner  # noqa: F401, E501
 from torch import nn
 from torchvision import datasets, transforms
 from tqdm import tqdm
-from pathlib import Path
-import nni  # noqa: F401
-from nni.compression.pytorch.pruning import ActivationAPoZRankPruner  # noqa: F401, E501
-from nni.compression.pytorch import ModelSpeedup  # noqa: F401
-import shutil
-import time
-import ai_edge_torch  # noqa: F401
 
 # For training use 'cuda', for evaluation purposes use 'cpu'
 DEVICE = "cpu"
@@ -183,8 +184,18 @@ class FashionClassifier(nn.Module):
         outputpath: Path
             Path to the output ONNX file
         """
-        # TODO implement
-        pass
+        dummy_input = torch.randn(1, 1, 28, 28).to(self.device)
+        torch.onnx.export(
+            self,
+            dummy_input,
+            outputpath,
+            export_params=True,
+            opset_version=11,
+            input_names=["input"],
+            output_names=["output"],
+            dynamic_axes={"input": {0: "batch_size"}, "output": {0: "batch_size"}},
+        )
+        print(f"Model saved to ONNX at {outputpath}")
 
     def convert_to_tflite(self, outputpath):
         """
@@ -195,8 +206,54 @@ class FashionClassifier(nn.Module):
         outputpath: Path
             Path to the output TFLite file
         """
-        # TODO implement
-        pass
+        dummy_input = (torch.randn(1, 1, 28, 28).to(self.device),)
+        edge_model = ai_edge_torch.convert(self.eval(), dummy_input)
+        edge_model.export(str(outputpath))
+
+
+def evaluator(model, tloader, criterion):
+    model.eval()
+    test_loss = 0
+    correct = 0
+    with torch.no_grad():
+        for data, target in tloader:
+            data, target = data.to(DEVICE), target.to(DEVICE)
+            output = model(data)
+            test_loss += criterion(output, target).item()
+            pred = output.argmax(dim=1, keepdim=True)
+            correct += pred.eq(target.view_as(pred)).sum().item()
+
+    test_loss /= len(tloader.dataset)
+    acc = 100 * correct / len(tloader.dataset)
+
+    print(
+        "\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n".format(
+            test_loss, correct, len(tloader.dataset), acc
+        )
+    )
+
+    return acc
+
+
+def trainer(model, optimizer, criterion, epoch, tloader):
+    model.train()
+    for batch_idx, (data, target) in enumerate(tloader):
+        data, target = data.to(DEVICE), target.to(DEVICE)
+        optimizer.zero_grad()
+        output = model(data)
+        loss = criterion(output, target)
+        loss.backward()
+        optimizer.step()
+        if batch_idx % 100 == 0:
+            print(
+                "Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}".format(
+                    epoch,
+                    batch_idx * len(data),
+                    len(tloader.dataset),
+                    100.0 * batch_idx / len(tloader),
+                    loss.item(),
+                )
+            )
 
 
 def main():
@@ -327,21 +384,40 @@ def main():
 
     # create a NNI-traced optimizer using the Adam optimizer
     # TODO add traced_optimizer
-    traced_optimizer = None  # noqa: F841
+    traced_optimizer = nni.trace(torch.optim.Adam)(
+        model.parameters(), lr=TRAINING_LEARNING_RATE
+    )  # noqa: F841
 
     # define the configuration of pruning algorithm
     # TODO fill config_list
-    config_list = []  # noqa: F841
+    config_list = [
+        {
+            "sparsity": 0.5,
+            "op_types": ["Conv2d", "Linear"],
+        },
+        {
+            "exclude": True,
+            "op_names": ["fc2"],
+            "op_types": ["Linear"],
+        },
+    ]  # noqa: F841
 
     def trainer(mod, opt, crit):
-        model.train_model(
+        mod.train_model(
             opt, crit, MEASUREMENTS_EPOCHS, trainloader, valloader, None, False
         )
 
     # define APoZRankPruner
     # TODO create ActivationAPoZRankPruner using
     # model, config_list, trainer, traced optimizer, ...
-    pruner = None
+    pruner = ActivationAPoZRankPruner(
+        model=model,
+        config_list=config_list,
+        trainer=trainer,
+        traced_optimizer=traced_optimizer,
+        criterion=criterion,
+        training_batches=1000,
+    )
 
     # compute pruning mask
     _, masks = pruner.compress()
@@ -355,6 +431,9 @@ def main():
 
     # TODO create ModelSpeedup object with model, masks
     # dummy_input and run speedup_model
+    dummy_input = torch.randn(1, 1, 28, 28).to(model.device)
+    m_speedup = ModelSpeedup(model, dummy_input, masks)
+    m_speedup.speedup_model()
 
     print("MODEL AFTER PRUNING")
     print(model)
@@ -362,8 +441,7 @@ def main():
     model.evaluate(testloader)
 
     # TODO define fine-tune optimizer
-    optimizer = None
-
+    optimizer = torch.optim.Adam(model.parameters(), lr=FINETUNE_LEARNING_RATE)
     model.train_model(
         optimizer,
         criterion,
@@ -382,7 +460,7 @@ def main():
         model.convert_to_onnx(args.onnx_model)
 
     if args.tflite_model:
-        model.convert_to_litert(args.tflite_model)
+        model.convert_to_tflite(args.tflite_model)
 
 
 if __name__ == "__main__":

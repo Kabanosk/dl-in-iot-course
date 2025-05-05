@@ -1,14 +1,72 @@
 import argparse
-import tensorflow as tf
-import tensorflow_model_optimization as tfmot
+import logging
+import multiprocessing
+import sys
+from functools import partial
 from pathlib import Path
 from typing import Optional
 
-from dl_in_iot_course.misc.pet_dataset import PetDataset
+import tensorflow as tf
+import tensorflow_model_optimization as tfmot
+from ai_edge_litert.interpreter import Interpreter
+
 from dl_in_iot_course.misc.modeltester import ModelTester
+from dl_in_iot_course.misc.pet_dataset import PetDataset
+
+logger = logging.Logger("ModelTester")
+formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+
+logdir = Path(__file__).parent / "logs"
+file_handler = logging.FileHandler(logdir / "log.txt")
+file_handler.setLevel(logging.DEBUG)
+file_handler.setFormatter(formatter)
+
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(formatter)
+
+logger.setLevel(logging.DEBUG)
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
 
 
-class TFMOTOptimizedModel(ModelTester):
+class FP32Model(ModelTester):
+    """
+    This tester tests the performance of FP32 TensorFlow Lite model.
+    """
+
+    def optimize_model(self, originalmodel: Path):
+        model = tf.keras.models.load_model(str(originalmodel))
+        converter = tf.lite.TFLiteConverter.from_keras_model(model)
+        tflite_model = converter.convert()
+        self.modelpath.write_bytes(tflite_model)
+        logger.info(f"Model converted and saved to {self.modelpath}")
+
+    def prepare_model(self):
+        self.model = Interpreter(
+            model_path=str(self.modelpath), num_threads=multiprocessing.cpu_count()
+        )
+
+        self.model.allocate_tensors()
+        logger.info(f"Model loaded with {multiprocessing.cpu_count()} threads.")
+
+    def preprocess_input(self, X):
+        # since we only want to measure inference time, not tensor allocation,
+        # we mode setting tensor to preprocess_input
+        self.model.set_tensor(self.model.get_input_details()[0]["index"], X)
+        logger.debug("Input data set for the interpreter.")
+
+    def run_inference(self):
+        self.model.invoke()
+
+    def postprocess_outputs(self, Y):
+        output_details = self.model.get_output_details()[0]
+        output = self.model.get_tensor(output_details["index"])
+        logger.debug("Output data retrieved from the interpreter.")
+        return output
+
+
+class TFMOTOptimizedModel(FP32Model):
     def compress_and_fine_tune(self, originalmodel: Path):
         """
         Runs selected compression algorithm and fine-tunes the model.
@@ -25,7 +83,20 @@ class TFMOTOptimizedModel(ModelTester):
         originalmodel : Path
             Path to the original model
         """
-        pass
+        model = tf.keras.models.load_model(str(originalmodel))
+        model.trainable = True
+        model.compile(optimizer=self.optimizer, loss=self.loss, metrics=self.metrics)
+        model.fit(
+            self.traindataset,
+            validation_data=self.validdataset,
+            epochs=self.epochs,
+        )
+        logger.info("Model fine-tuned")
+
+        converter = tf.lite.TFLiteConverter.from_keras_model(model)
+        tflite_model = converter.convert()
+        self.modelpath.write_bytes(tflite_model)
+        logger.info("Model converted and saved to {self.modelpath}")
 
     def optimize_model(self, originalmodel: Path):
         def preprocess_input(path, onehot):
@@ -73,17 +144,6 @@ class TFMOTOptimizedModel(ModelTester):
         # method to implement
         self.compress_and_fine_tune(originalmodel)
 
-    # If l02_quantization tasks are finished, just use the FP32Model class as
-    # a parent in order not to implement below methods
-
-    # TODO def prepare_model(self):
-
-    # TODO def preprocess_input(self, X):
-
-    # TODO def run_inference(self):
-
-    # TODO def postprocess_outputs(self, Y):
-
 
 class ClusteredModel(TFMOTOptimizedModel):
     """
@@ -122,8 +182,30 @@ class ClusteredModel(TFMOTOptimizedModel):
         super().__init__(dataset, modelpath, originalmodel, logdir)
 
     def compress_and_fine_tune(self, originalmodel):
-        # TODO implement the model clustering and fine-tuning
-        pass
+        model = tf.keras.models.load_model(str(originalmodel))
+        model.trainable = True
+
+        clastered_model = tfmot.clustering.keras.cluster_weights(
+            model,
+            number_of_clusters=self.num_clusters,
+            cluster_centroids_init=tfmot.clustering.keras.CentroidInitialization.LINEAR,
+        )
+
+        clastered_model.compile(
+            optimizer=self.optimizer, loss=self.loss, metrics=self.metrics
+        )
+        clastered_model.fit(
+            self.traindataset,
+            validation_data=self.validdataset,
+            epochs=self.epochs,
+        )
+        logger.info("Model fine-tuned")
+        stripped_model = tfmot.clustering.keras.strip_clustering(clastered_model)
+
+        converter = tf.lite.TFLiteConverter.from_keras_model(stripped_model)
+        tflite_model = converter.convert()
+        self.modelpath.write_bytes(tflite_model)
+        logger.info(f"Model converted and saved to {self.modelpath}")
 
 
 class PrunedModel(TFMOTOptimizedModel):
@@ -166,7 +248,28 @@ class PrunedModel(TFMOTOptimizedModel):
         self.sched = tfmot.sparsity.keras.ConstantSparsity(
             self.target_sparsity, begin_step=0, end_step=1, frequency=1
         )
-        # TODO implement model pruning and fine-tuning
+
+        model = tf.keras.models.load_model(str(originalmodel))
+        model.trainable = True
+
+        pruned_model = tfmot.sparsity.keras.prune_low_magnitude(model, self.sched)
+        pruned_model.compile(
+            optimizer=self.optimizer, loss=self.loss, metrics=self.metrics
+        )
+
+        pruned_model.fit(
+            self.traindataset,
+            validation_data=self.validdataset,
+            epochs=self.epochs,
+            callbacks=[tfmot.sparsity.keras.UpdatePruningStep()],
+        )
+
+        logger.info("Model fine-tuned")
+        stripped_model = tfmot.sparsity.keras.strip_pruning(pruned_model)
+        converter = tf.lite.TFLiteConverter.from_keras_model(stripped_model)
+        tflite_model = converter.convert()
+        self.modelpath.write_bytes(tflite_model)
+        logger.info(f"Model converted and saved to {self.modelpath}")
 
 
 if __name__ == "__main__":
@@ -203,18 +306,12 @@ if __name__ == "__main__":
     tasks = {}
 
     for num_clusters in [2, 4, 8, 16, 32]:
-        tasks[f"clustered-{num_clusters}-fp32"] = (
-            lambda dataset, args, num_clusters=num_clusters: tflite_clustered(
-                dataset, args, num_clusters
-            )
-        )
+        clustered_fn = partial(tflite_clustered, num_clusters=num_clusters)
+        tasks[f"clustered-{num_clusters}-fp32"] = clustered_fn
 
     for sparsity in [0.2, 0.4, 0.5]:
-        tasks[f"pruned-{sparsity}-fp32"] = (
-            lambda dataset, args, sparsity=sparsity: tflite_pruning(
-                dataset, args, sparsity
-            )
-        )
+        pruned_fn = partial(tflite_pruning, sparsity=sparsity)
+        tasks[f"pruned-{sparsity}-fp32"] = pruned_fn
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", help="Path to the model file", type=Path)
